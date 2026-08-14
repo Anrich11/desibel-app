@@ -17,8 +17,14 @@
   notification-worthy subset, decided server-side by the `evaluate_alert()`
   trigger, not by firmware).
 
-  Single file, no build step, no npm. Hosted on Supabase Storage for phone
-  access; double-clicking it locally still works too.
+  Single file, no build step, no npm. Hosted on GitHub Pages for phone access
+  (github.com/Anrich11/desibel-app -> anrich11.github.io/desibel-app/) —
+  double-clicking it locally still works too. NOT Supabase Storage: Supabase
+  forces Content-Type: text/plain on anything it detects as HTML, on BOTH
+  Storage and Edge Functions, unconditionally — a deliberate anti-phishing
+  guardrail with no per-project override, discovered and confirmed live
+  2026-08-13 (see git history / session notes for the full story). It can
+  never serve this file as an executable page, hence GitHub Pages instead.
 
   SECURITY: this uses the PUBLISHABLE key, which is safe to ship in a browser
   ONLY because RLS was enabled on 2026-08-05 in migration
