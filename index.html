@@ -565,10 +565,22 @@ const numInput = (id, val, lo, hi, step) =>
      style="width:100%;background:var(--panel2);color:var(--ink);border:1px solid var(--line);
             border-radius:6px;padding:6px 8px;font:inherit">`;
 
-async function renderSettings(){
+// ⛔⛔ BUG FOUND 2026-08-14: renderDetail() runs on EVERY auto-refresh tick
+//     (every 1s, see AUTO_MS) and used to call renderSettings() unconditionally
+//     every single time — re-fetching from the backend and rebuilding the whole
+//     form from whatever's currently SAVED there. Any edit typed but not yet
+//     saved got silently wiped within a second, every time, on every device.
+//     settingsLoadedFor is the fix: only actually re-fetch/re-render when the
+//     selected device changes, or a caller explicitly asks for a fresh copy
+//     (force=true — used once, right after a successful Save, to confirm the
+//     new state e.g. "ntfy topic configured").
+let settingsLoadedFor = null;
+
+async function renderSettings(force){
   const d = devices.find(x => x.id === selected);
   const box = $("settingsPanel");
-  if (!d){ box.innerHTML = `<div class="empty">—</div>`; return; }
+  if (!d){ box.innerHTML = `<div class="empty">—</div>`; settingsLoadedFor = null; return; }
+  if (!force && settingsLoadedFor === d.id) return;   // already showing this device; don't clobber an in-progress edit
 
   const forId = d.id;   // ⚠ same staleness guard as liveIngest — the user can
                          //   pick a different device while this fetch is in
@@ -617,6 +629,7 @@ async function renderSettings(){
       firmware floor (~88 dB) regardless of this setting — a lower threshold here
       will still work, just only via the periodic path, not instantly.
     </div>`;
+  settingsLoadedFor = forId;   // set only once the form is actually showing this device
 
   $("setSave").onclick = async () => {
     const btn = $("setSave"), status = $("setStatus");
@@ -633,7 +646,7 @@ async function renderSettings(){
       const r = await saveSettings(forId, patch);
       if (!r.ok) throw new Error(r.error || "save failed");
       status.textContent = "saved " + new Date().toLocaleTimeString();
-      if (selected === forId) renderSettings();
+      if (selected === forId) renderSettings(true);   // force: confirm the saved state (e.g. ntfy topic now "configured")
     } catch (e) {
       status.textContent = "error: " + (e.message || e);
     } finally {
