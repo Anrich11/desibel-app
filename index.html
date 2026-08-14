@@ -1,0 +1,1069 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>desibel. — fleet</title>
+<!--
+  Desibel App — v1 2026-08-05, extended 2026-08-13 for field testing.
+
+  v1 scope (brief §6) was three things only: list devices, latest reading per
+  device, alert history. Extended with: a fleet KPI bar, per-device alert
+  settings (dB threshold + consecutive-check-in count + ntfy.sh topic, backed
+  by the `settings` Edge Function), a fired-alerts log with real/false-alarm
+  feedback capture (`public.alerts` — the seed of the accuracy-improvement
+  loop), and the renamed "Sound events" panel (was "Alert history" — same
+  data, `telemetry` where kind != checkin; "Alerts" above it is the actual
+  notification-worthy subset, decided server-side by the `evaluate_alert()`
+  trigger, not by firmware).
+
+  Single file, no build step, no npm. Hosted on Supabase Storage for phone
+  access; double-clicking it locally still works too.
+
+  SECURITY: this uses the PUBLISHABLE key, which is safe to ship in a browser
+  ONLY because RLS was enabled on 2026-08-05 in migration
+  `rls_readonly_anon_for_app_v1`:
+    - anon/authenticated = SELECT only on devices/telemetry, no write policy
+    - devices.device_key is NOT granted to anon — verified returning 401
+    - the `ingest` Edge Function uses the service role and bypasses all of it
+  If you ever see this key able to write to devices/telemetry, something has
+  been rolled back.
+  ⚠ Two narrow, deliberate exceptions added 2026-08-13, both documented at
+    their point of use: (1) anon CAN update `alerts.feedback`/`feedback_at`
+    directly — the one write anon gets anywhere in this schema, and nothing
+    in that row is secret; (2) settings WRITES go through the `settings` Edge
+    Function (service role, not the anon client) — but that function has NO
+    auth in front of it beyond "you have this page's URL", because there is no
+    login system anywhere in this app. See SETTINGS_URL below for the full
+    reasoning on that trade-off.
+-->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2129; --line:#262d38;
+    --ink:#e6edf3; --dim:#8b949e; --dimmer:#6e7681;
+    --blue:#3b82f6; --green:#3fb950; --amber:#d29922; --red:#f85149;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  header{
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+    padding:18px 24px; border-bottom:1px solid var(--line); background:var(--panel);
+    position:sticky; top:0; z-index:10;
+  }
+  .brand{font-size:22px; font-weight:800; letter-spacing:-.02em}
+  .brand i{color:var(--blue); font-style:normal}
+  .spacer{flex:1}
+  .meta{font:12px/1.4 var(--mono); color:var(--dimmer); text-align:right}
+  button{
+    font:inherit; font-size:13px; color:var(--ink); background:var(--panel2);
+    border:1px solid var(--line); border-radius:7px; padding:7px 13px; cursor:pointer;
+  }
+  button:hover{border-color:#3d4756}
+  button:disabled{opacity:.5; cursor:default}
+
+  main{padding:22px 24px 60px; max-width:1180px; margin:0 auto}
+  .banner{
+    display:none; gap:10px; align-items:flex-start;
+    background:rgba(210,153,34,.10); border:1px solid rgba(210,153,34,.35);
+    border-radius:9px; padding:11px 14px; margin-bottom:20px; font-size:13px;
+  }
+  .banner.on{display:flex}
+  .banner b{color:var(--amber)}
+  .banner code{font:12px var(--mono); background:rgba(0,0,0,.35); padding:2px 6px; border-radius:4px}
+
+  h2{font-size:12px; letter-spacing:.11em; text-transform:uppercase; color:var(--dim);
+     margin:30px 0 12px; font-weight:600}
+  h2:first-of-type{margin-top:0}
+
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:14px}
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:11px;
+    padding:16px 18px; cursor:pointer; transition:border-color .12s, transform .12s;
+  }
+  .card:hover{border-color:#3d4756; transform:translateY(-1px)}
+  .card.sel{border-color:var(--blue)}
+  .card .top{display:flex; align-items:center; gap:9px; margin-bottom:3px}
+  .card .nm{font-weight:650; font-size:16px}
+  .card .id{font:11px var(--mono); color:var(--dimmer); margin-bottom:14px}
+
+  .dot{width:8px; height:8px; border-radius:50%; flex:none}
+  .dot.ok{background:var(--green); box-shadow:0 0 0 3px rgba(63,185,80,.16)}
+  .dot.warn{background:var(--amber); box-shadow:0 0 0 3px rgba(210,153,34,.16)}
+  .dot.dead{background:var(--dimmer)}
+  .pill{font:10px var(--mono); text-transform:uppercase; letter-spacing:.06em;
+        border:1px solid var(--line); border-radius:20px; padding:2px 9px; color:var(--dim)}
+
+  .kv{display:grid; grid-template-columns:repeat(3,1fr); gap:12px 8px}
+  .kv div span{display:block; font:10px var(--mono); letter-spacing:.05em;
+               text-transform:uppercase; color:var(--dimmer); margin-bottom:3px}
+  .kv div b{font-weight:600; font-size:17px; font-variant-numeric:tabular-nums}
+  .kv .na{color:var(--dimmer); font-weight:400; font-size:15px}
+  .why{display:block; font:9px var(--mono); letter-spacing:.05em; text-transform:uppercase;
+       color:#4d5560; margin-top:2px; font-weight:600}
+  .pill.ph{border-color:rgba(59,130,246,.4); color:var(--blue); margin-left:6px}
+  .u{font-size:11px; color:var(--dim); font-weight:400; margin-left:1px}
+
+  .panel{background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:18px}
+  .chartwrap{height:230px; position:relative}
+
+  table{width:100%; border-collapse:collapse; font-size:13.5px}
+  th{
+    text-align:left; font:10px var(--mono); letter-spacing:.07em; text-transform:uppercase;
+    color:var(--dimmer); font-weight:600; padding:0 12px 9px 0; border-bottom:1px solid var(--line);
+  }
+  td{padding:10px 12px 10px 0; border-bottom:1px solid #1e242d; font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:0}
+  .tag{font:10px var(--mono); text-transform:uppercase; letter-spacing:.05em;
+       padding:2px 8px; border-radius:5px; font-weight:600}
+  .tag.alert{background:rgba(248,81,73,.15); color:var(--red)}
+  .tag.warning{background:rgba(210,153,34,.15); color:var(--amber)}
+  .tag.anomaly{background:rgba(59,130,246,.15); color:var(--blue)}
+  .muted{color:var(--dim)}
+  .empty{padding:40px 16px; text-align:center; color:var(--dimmer); font-size:14px}
+  .err{
+    background:rgba(248,81,73,.09); border:1px solid rgba(248,81,73,.35);
+    border-radius:9px; padding:14px 16px; font-size:13.5px;
+  }
+  .err b{color:var(--red)}
+  .err code{font:12px var(--mono); display:block; margin-top:7px; color:var(--dim); white-space:pre-wrap}
+  /* ---- LIVE LEVEL PANEL (2026-08-06) ------------------------------------- */
+  .live{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:18px;
+        background:var(--panel); border:1px solid var(--line); border-radius:11px;
+        padding:18px 20px}
+  .lvl{min-width:0}
+  .lvl .hd{display:flex; align-items:baseline; gap:8px; margin-bottom:2px}
+  .lvl .hd span{font:10px var(--mono); letter-spacing:.07em; text-transform:uppercase;
+                color:var(--dimmer); font-weight:600}
+  .lvl .big{font-size:52px; font-weight:700; line-height:1.05; letter-spacing:-.03em;
+            font-variant-numeric:tabular-nums}
+  .lvl .big small{font-size:17px; font-weight:500; color:var(--dim); margin-left:4px;
+                  letter-spacing:0}
+  .lvl.flat .big{color:var(--amber)}
+  .lvl.hp   .big{color:var(--blue)}
+  .lvl .big.stale{color:var(--dimmer)}
+  .lvl .sub{font:11px var(--mono); color:var(--dim); margin-top:5px}
+  .lvl .note{font:10px var(--mono); color:#4d5560; margin-top:3px; line-height:1.45}
+  .sparkwrap{grid-column:1/-1; height:96px; position:relative; margin-top:4px}
+  .sparkwrap canvas{width:100%; height:100%; display:block}
+  .verdict{grid-column:1/-1; border-top:1px solid var(--line); padding-top:13px;
+           font-size:12.5px; color:var(--dim); line-height:1.6}
+  .verdict b{color:var(--ink); font-variant-numeric:tabular-nums}
+  .verdict .q{font:10px var(--mono); letter-spacing:.07em; text-transform:uppercase;
+              color:var(--dimmer); display:block; margin-bottom:5px; font-weight:600}
+  @media(max-width:560px){ .kv{grid-template-columns:repeat(2,1fr)} main{padding:16px}
+    .live{grid-template-columns:1fr} .lvl .big{font-size:40px} }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">desibel<i>.</i></div>
+  <div class="pill" id="scope">fleet</div>
+  <div class="spacer"></div>
+  <button id="refresh">Refresh</button>
+  <label style="margin-left:10px;font-size:13px;user-select:none;cursor:pointer">
+    <input type="checkbox" id="autorefresh" checked> live
+    <span id="autotick" style="opacity:.5;font-size:12px"></span>
+  </label>
+  <div class="meta" id="meta">connecting…</div>
+</header>
+
+<main>
+  <div class="banner" id="demoBanner">
+    <div>
+      <b>Demo data present.</b> Rows tagged <code>payload.demo = "true"</code> were seeded
+      on 2026-08-05 so this screen had something to render. <b>They are not real readings.</b>
+      Purge with <code>delete from telemetry where payload-&gt;&gt;'demo' = 'true';</code>
+    </div>
+  </div>
+
+  <div id="fatal"></div>
+
+  <h2 id="liveHead">Live level</h2>
+  <div class="live">
+    <div class="lvl flat">
+      <div class="hd"><span>Full band · unweighted</span></div>
+      <div class="big" id="lvFlat">—</div>
+      <div class="sub" id="lvFlatSub">peak —</div>
+      <div class="note">⛔ Z-weighted, not dBA. Do not compare to a noise limit
+        or to a Minut reading.</div>
+    </div>
+    <div class="lvl hp">
+      <div class="hd"><span id="lvHpLabel">Above 200 Hz · diagnostic</span></div>
+      <div class="big" id="lvHp">—</div>
+      <div class="sub" id="lvHpSub">peak —</div>
+      <div class="note">⛔ Band-limited. Not dBA either, and not a quotable SPL.
+        It exists to answer one question — see below.</div>
+    </div>
+    <div class="sparkwrap"><canvas id="spark"></canvas></div>
+    <div class="verdict" id="verdict">
+      <span class="q">Is the flat level pinned by low-frequency energy?</span>
+      Waiting for readings.
+    </div>
+  </div>
+
+  <h2>Fleet</h2>
+  <div class="grid" id="kpis"><div class="empty">Loading…</div></div>
+
+  <h2>Devices</h2>
+  <div class="grid" id="devices"><div class="empty">Loading…</div></div>
+
+  <h2 id="latestHead">Latest reading</h2>
+  <div class="panel">
+    <div class="kv" id="latest"><div class="empty">—</div></div>
+  </div>
+
+  <h2>Alert settings</h2>
+  <div class="panel" id="settingsPanel"><div class="empty">—</div></div>
+
+  <h2>Last 24 hours</h2>
+  <div class="panel chartwrap"><canvas id="chart"></canvas></div>
+
+  <h2>Alerts</h2>
+  <div class="panel">
+    <table id="alertsTable">
+      <thead><tr><th>When</th><th>Rule</th><th>Noise</th><th>Threshold</th><th>Sent</th><th>Feedback</th></tr></thead>
+      <tbody><tr><td colspan="6" class="empty">—</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>Sound events</h2>
+  <div class="panel">
+    <table id="alertTable">
+      <thead><tr><th>When</th><th>Kind</th><th>Noise</th><th>VOC</th><th>Battery</th><th>Type</th></tr></thead>
+      <tbody><tr><td colspan="6" class="empty">—</td></tr></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const SUPABASE_URL = "https://cquhdxnxulnwozennofa.supabase.co";
+const PUBLISHABLE  = "sb_publishable_mPPItpPzLtqa2vo1m4Wj-Q_CSbm1L-Z";
+const db = supabase.createClient(SUPABASE_URL, PUBLISHABLE);
+
+// ⚠ No auth in front of this endpoint — there is no login system anywhere in
+//   this app, by design (v1 scope). Anyone with this page's URL can already
+//   read everything above via the publishable key; this endpoint additionally
+//   lets them change alert settings for any device. Same trust boundary the
+//   app's read access already relies on, documented rather than hidden — see
+//   the settings Edge Function's own header comment for the full reasoning.
+const SETTINGS_URL = SUPABASE_URL + "/functions/v1/settings";
+
+let devices = [], selected = null, chart = null;
+
+// ⛔⛔ EVERY QUERY IN THIS FILE USED TO BE UN-TIMED, AND ON 2026-08-06 THAT HUNG
+//    THE WHOLE APP. A fetch that never settles means the await never returns,
+//    which means load()'s finally never runs, which means autoBusy stays true
+//    and the auto-refresh timer never reschedules. The screen sits on "loading…"
+//    forever, with no error, no retry, and a Refresh button that is still
+//    disabled. The device was posting perfectly the entire time.
+//
+// ⭐ THE FAILURE LOOKED IDENTICAL TO A DEAD DEVICE, AND IT WAS THE OPPOSITE.
+//   That is the third time this week a display problem has been read as a
+//   hardware problem. A stalled request MUST become a visible error, because an
+//   app that says nothing is indistinguishable from an app that is waiting.
+const QUERY_TIMEOUT_MS = 12000;
+function withTimeout(p, what){
+  let timer;
+  const bomb = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(
+      `${what} did not respond within ${QUERY_TIMEOUT_MS/1000}s`)), QUERY_TIMEOUT_MS);
+  });
+  // ⚠ Promise.race leaves the loser pending; clearing the timer stops a stray
+  //   rejection firing later against a request that actually succeeded.
+  return Promise.race([Promise.resolve(p), bomb]).finally(() => clearTimeout(timer));
+}
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function ago(ts){
+  if(!ts) return "never";
+  const s = (Date.now() - new Date(ts)) / 1000;
+  if (s < 90)    return Math.round(s) + "s ago";
+  if (s < 5400)  return Math.round(s/60) + "m ago";
+  if (s < 172800)return Math.round(s/3600) + "h ago";
+  return Math.round(s/86400) + "d ago";
+}
+// A device is only "ok" if we heard from it recently. Silence is the failure
+// mode that matters on a battery device -- a unit that stopped reporting looks
+// identical to a healthy one if you only render the last row you were given.
+function health(ts){
+  if(!ts) return {c:"dead", t:"no data"};
+  const h = (Date.now() - new Date(ts)) / 3.6e6;
+  if (h < 1)  return {c:"ok",   t:"live"};
+  if (h < 24) return {c:"warn", t:"quiet"};
+  return {c:"dead", t:"offline"};
+}
+// A null needs a REASON. "Sensor not built yet" and "sensor failed" are the
+// same dash on screen, and treating them the same is how a broken unit hides.
+// The firmware tells us which: payload.phase / payload.sensors_enabled.
+// Added 2026-08-05 when Phase A's first real reading rendered six blank fields.
+function nullReason(row, field){
+  if(!row) return "";
+  const sensorFields = ["board_temp_c","humidity_pct","lux","voc_index","nox_index","occupancy"];
+  const p = row.payload || {};
+
+  // ⭐ ADDED with the comparator wake-on-sound feature: a sound-triggered row
+  //   deliberately skips the I2C sensor suite (mic-only, ~450ms vs ~1300ms) so
+  //   its null humidity/lux/VOC fields must not read as a sensor failure.
+  if (p.reading_scope === "mic_only" && sensorFields.includes(field))
+    return "sound-triggered, I2C skipped";
+
+  // ⛔ "not in v1" for noise_db was REMOVED 2026-08-06. It is wrong now: U10
+  //    (ICS-43434) drives a real level. It was also only ever half true — it
+  //    described a firmware decision that had hardened into "the board has no
+  //    microphone", which it never did.
+  if (field === "noise_db" && p.sensors_enabled === false) return "phase B";
+
+  // ⭐ NULL BY DECISION IS NOT NULL BY FAILURE, AND THEY MUST NOT LOOK ALIKE.
+  //    These three are deliberately never sent, each for a documented reason.
+  //    Rendering them as "no data" would say the sensor broke.
+  if (field === "voc_index" || field === "nox_index") return "index computed server-side";
+  if (field === "occupancy")                          return "needs event logic";
+
+  if (sensorFields.includes(field) &&
+      (p.sensors_enabled === false || p.phase === "A")) return "phase B";
+  return "no data";
+}
+
+// ⛔ THE MICROPHONE REPORTS UNWEIGHTED (Z) SPL, NOT dBA. Every noise regulation
+//    and every Minut screen quotes dBA. Showing a bare "dB" invites exactly the
+//    comparison that is not valid, so the weighting is rendered next to the
+//    number and comes from the row itself — never assumed.
+const noiseUnit = row => {
+  const w = row && row.payload && row.payload.noise_weighting;
+  return w ? " dB" + w : " dB";
+};
+const num = (v, unit, dp=0, row=null, field=null) =>
+  (v === null || v === undefined)
+    ? `<b class="na">—<span class="why">${row?nullReason(row,field):""}</span></b>`
+    : `<b>${Number(v).toFixed(dp)}<span class="u">${unit}</span></b>`;
+
+function fatal(msg, detail){
+  $("fatal").innerHTML =
+    `<div class="err"><b>${esc(msg)}</b><code>${esc(detail)}</code></div>`;
+}
+
+async function load(){
+  $("refresh").disabled = true;
+  $("meta").textContent = "loading…";
+  try{
+    const { data: devs, error: dErr } = await withTimeout(db
+      .from("devices").select("id,name,location,status,deployed_at,created_at").order("id"),
+      "device list");
+    if (dErr) throw dErr;
+    devices = devs || [];
+
+    // Latest row per device. v1 has one device, so N+1 is fine and honest;
+    // revisit with a view if the fleet grows past ~50.
+    for (const d of devices){
+      const { data } = await withTimeout(db.from("telemetry")
+        .select("*").eq("device_id", d.id).order("ts",{ascending:false}).limit(1),
+        `latest reading for ${d.id}`);
+      d.latest = data && data[0] ? data[0] : null;
+    }
+
+    if(!selected || !devices.find(d => d.id === selected))
+      selected = devices[0] ? devices[0].id : null;
+
+    // Demo banner is a property of the DATABASE, not of the selected device.
+    // ⚠ It used to be toggled at the end of renderDetail(), which returns early
+    //   when a device has no readings — so once the banner was on it could never
+    //   turn off. Purging the demo rows left the warning up, i.e. the UI was
+    //   asserting something about the data that was no longer true. Fixed
+    //   2026-08-05 by asking the database directly.
+    const { count: demoCount } = await withTimeout(db.from("telemetry")
+      .select("id", { count: "exact", head: true })
+      .eq("payload->>demo", "true"), "demo-row count");
+    $("demoBanner").classList.toggle("on", (demoCount || 0) > 0);
+
+    renderDevices();
+    renderKpis();
+    await renderDetail();
+
+    $("meta").innerHTML = `${devices.length} device${devices.length===1?"":"s"}<br>updated ${new Date().toLocaleTimeString()}`;
+    $("fatal").innerHTML = "";
+  }catch(e){
+    fatal("Could not reach the database.", (e && (e.message || e.hint)) || String(e));
+    $("meta").textContent = "error";
+  }finally{
+    $("refresh").disabled = false;
+  }
+}
+
+function renderDevices(){
+  if(!devices.length){
+    $("devices").innerHTML = `<div class="empty">No devices registered yet.<br>
+      Add one with <code>insert into devices (id,status) values ('desibel-002','bench')</code></div>`;
+    return;
+  }
+  $("devices").innerHTML = devices.map(d => {
+    const L = d.latest, h = health(L && L.ts);
+    return `<div class="card ${d.id===selected?"sel":""}" data-id="${esc(d.id)}">
+      <div class="top">
+        <span class="dot ${h.c}"></span>
+        <span class="nm">${esc(d.name || d.id)}</span>
+        <span class="spacer"></span>
+        <span class="pill">${esc(d.status)}</span>${L && L.payload && L.payload.phase ? `<span class="pill ph">phase ${esc(L.payload.phase)}</span>` : ""}
+      </div>
+      <div class="id">${esc(d.id)} · ${h.t} · ${L ? ago(L.ts) : "no readings"}</div>
+      <div class="kv">
+        <div><span>Battery</span>${num(L && L.battery_mv != null ? L.battery_mv/1000 : null,"V",2)}</div>
+        <div><span>Noise</span>${num(L && L.noise_db,"dB",0,L,"noise_db")}</div>
+        <div><span>Temp</span>${num(L && L.board_temp_c,"°C",1,L,"board_temp_c")}</div>
+      </div>
+    </div>`;
+  }).join("");
+
+  document.querySelectorAll(".card").forEach(c =>
+    // ⚠ liveReset() is not optional. The buffer holds one device's trace;
+    //   carrying it across a selection change would splice two boards into one
+    //   line and it would look completely plausible.
+    c.onclick = () => { selected = c.dataset.id; liveReset();
+                        renderDevices(); renderDetail(); });
+}
+
+// ============================================================================
+//  FLEET KPIs  (added with the alerts/settings feature)
+// ============================================================================
+// Zero new queries — purely a derived render over the devices[] array load()
+// already fetched (each has .latest attached). "Anomaly" aggregates fields the
+// firmware's field-safety session already puts in payload: usb_anomaly and
+// battery_overvolt are report-only flags (never acted on by firmware, by
+// design — see config.h), rst_brownout is the remote-visible precursor to a
+// 3V3 collapse, and elevated wifi_fails/auth_fails flag a unit approaching
+// either "offline" or "revoked" before it actually goes dark.
+function computeKpis(){
+  let online = 0;
+  let lowestBattery = null, lowestBatteryDev = null;
+  let loudest = null, loudestDev = null, loudestUnit = " dB";
+  let worstRssi = null, worstRssiDev = null;
+  const anomalies = [];
+
+  for (const d of devices){
+    const L = d.latest;
+    if (L && health(L.ts).c === "ok") online++;
+    if (!L) continue;
+    const p = L.payload || {};
+
+    // ⛔ Same rule the payload itself carries: while USB is present, battery_mv
+    //   is a node voltage, not a state of charge. Excluding it here is the same
+    //   discipline as the "(on USB — not a charge level)" label in Latest reading.
+    const onUsb = p.battery_context === "usb_present_not_soc";
+    if (!onUsb && L.battery_mv != null){
+      const v = L.battery_mv / 1000;
+      if (lowestBattery == null || v < lowestBattery){ lowestBattery = v; lowestBatteryDev = d; }
+    }
+    if (L.noise_db != null && (loudest == null || L.noise_db > loudest)){
+      loudest = L.noise_db; loudestDev = d; loudestUnit = noiseUnit(L);
+    }
+    if (L.rssi != null && (worstRssi == null || L.rssi < worstRssi)){
+      worstRssi = L.rssi; worstRssiDev = d;
+    }
+
+    const flags = [];
+    if (p.usb_anomaly)                 flags.push("USB present");
+    if (p.battery_overvolt)            flags.push("battery overvolt");
+    if ((p.rst_brownout || 0) > 0)     flags.push(`${p.rst_brownout} brownout${p.rst_brownout===1?"":"s"}`);
+    if ((p.wifi_fails || 0) >= 3)      flags.push("offline");
+    if ((p.auth_fails || 0) > 0)       flags.push("auth failing");
+    if (flags.length) anomalies.push({ dev: d, flags });
+  }
+
+  return { online, total: devices.length, lowestBattery, lowestBatteryDev,
+           loudest, loudestDev, loudestUnit, worstRssi, worstRssiDev, anomalies };
+}
+
+function renderKpis(){
+  const k = computeKpis();
+  const tile = (label, valueHtml, dev) => `
+    <div class="card" ${dev ? `data-id="${esc(dev.id)}"` : `style="cursor:default"`}>
+      <div class="kv" style="grid-template-columns:1fr">
+        <div><span>${esc(label)}</span>${valueHtml}</div>
+      </div>
+    </div>`;
+
+  const parts = [
+    tile("Fleet online", `<b>${k.online}<span class="u"> / ${k.total}</span></b>`, null),
+    tile("Lowest battery",
+      k.lowestBattery != null
+        ? `<b>${k.lowestBattery.toFixed(2)}<span class="u"> V</span></b> <span class="muted">${esc(k.lowestBatteryDev.name || k.lowestBatteryDev.id)}</span>`
+        : `<b class="na">—</b>`,
+      k.lowestBatteryDev),
+    tile("Loudest now",
+      k.loudest != null
+        ? `<b>${k.loudest.toFixed(1)}<span class="u">${k.loudestUnit}</span></b> <span class="muted">${esc(k.loudestDev.name || k.loudestDev.id)}</span>`
+        : `<b class="na">—</b>`,
+      k.loudestDev),
+    tile("Weakest signal",
+      k.worstRssi != null
+        ? `<b>${k.worstRssi}<span class="u"> dBm</span></b> <span class="muted">${esc(k.worstRssiDev.name || k.worstRssiDev.id)}</span>`
+        : `<b class="na">—</b>`,
+      k.worstRssiDev),
+  ];
+
+  const anomHtml = k.anomalies.length
+    ? k.anomalies.map(a =>
+        `<div style="margin-bottom:4px;cursor:pointer" data-id="${esc(a.dev.id)}">
+           <b style="color:var(--amber)">${esc(a.dev.name || a.dev.id)}</b>: ${a.flags.map(esc).join(", ")}
+         </div>`).join("")
+    : `<b style="color:var(--green);font-size:15px">none</b>`;
+  parts.push(`<div class="card" style="cursor:default">
+    <div class="kv" style="grid-template-columns:1fr">
+      <div><span>Anomalies</span>${anomHtml}</div>
+    </div>
+  </div>`);
+
+  $("kpis").innerHTML = parts.join("");
+  $("kpis").querySelectorAll("[data-id]").forEach(el =>
+    el.onclick = () => { selected = el.dataset.id; liveReset(); renderDevices(); renderDetail(); });
+}
+
+// ============================================================================
+//  ALERT SETTINGS  (calls the `settings` Edge Function, not the anon client —
+//  writes here are service-role only, same pattern as devices/telemetry)
+// ============================================================================
+async function loadSettings(deviceId){
+  const r = await withTimeout(
+    fetch(`${SETTINGS_URL}?device_id=${encodeURIComponent(deviceId)}`).then(r => r.json()),
+    "settings load");
+  return r;
+}
+async function saveSettings(deviceId, patch){
+  const r = await withTimeout(
+    fetch(SETTINGS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId, ...patch }),
+    }).then(r => r.json()),
+    "settings save");
+  return r;
+}
+
+const fieldBox = (label, inner) => `
+  <label style="display:block">
+    <span style="display:block;font:10px var(--mono);text-transform:uppercase;
+                 color:var(--dimmer);margin-bottom:5px">${label}</span>
+    ${inner}
+  </label>`;
+const numInput = (id, val, lo, hi, step) =>
+  `<input type="number" id="${id}" value="${val}" min="${lo}" max="${hi}" step="${step}"
+     style="width:100%;background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+            border-radius:6px;padding:6px 8px;font:inherit">`;
+
+async function renderSettings(){
+  const d = devices.find(x => x.id === selected);
+  const box = $("settingsPanel");
+  if (!d){ box.innerHTML = `<div class="empty">—</div>`; return; }
+
+  const forId = d.id;   // ⚠ same staleness guard as liveIngest — the user can
+                         //   pick a different device while this fetch is in
+                         //   flight, and a late response must not overwrite it.
+  box.innerHTML = `<div class="empty">Loading settings…</div>`;
+
+  let s;
+  try { s = await loadSettings(forId); }
+  catch (e) {
+    if (selected !== forId) return;
+    box.innerHTML = `<div class="err"><b>Could not load settings.</b><code>${esc(e.message || e)}</code></div>`;
+    return;
+  }
+  if (selected !== forId) return;
+  if (!s.ok) {
+    box.innerHTML = `<div class="err"><b>Could not load settings.</b><code>${esc(s.error || "unknown error")}</code></div>`;
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="kv" style="grid-template-columns:repeat(2,1fr);gap:16px 20px;margin-bottom:16px">
+      ${fieldBox("Enabled", `<input type="checkbox" id="setEnabled" ${s.alert_enabled ? "checked" : ""}>`)}
+      ${fieldBox("Threshold (dB)", numInput("setThreshold", s.threshold_db, 30, 140, 0.5))}
+      ${fieldBox("Consecutive check-ins", numInput("setConsecutive", s.consecutive_count, 1, 20, 1))}
+      ${fieldBox("Cooldown (min)", numInput("setCooldown", s.cooldown_minutes, 1, 1440, 1))}
+      <label style="display:block;grid-column:1/-1">
+        <span style="display:block;font:10px var(--mono);text-transform:uppercase;color:var(--dimmer);margin-bottom:5px">
+          ntfy.sh topic
+          ${s.ntfy_topic_set
+            ? '<span style="color:var(--green)">· configured</span>'
+            : '<span style="color:var(--dimmer)">· not set — alerts will not push</span>'}
+        </span>
+        <input type="text" id="setTopic" autocomplete="off"
+          placeholder="${s.ntfy_topic_set ? "leave blank to keep the current topic" : "e.g. desibel-yourhouse-8f2k"}"
+          style="width:100%;background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+                 border-radius:6px;padding:6px 8px;font:inherit">
+      </label>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <button id="setSave">Save settings</button>
+      <span id="setStatus" style="font-size:12.5px;color:var(--dim)"></span>
+    </div>
+    <div style="margin-top:12px;font-size:11.5px;color:var(--dimmer);line-height:1.5">
+      ⚠ This threshold drives the periodic path (every check-in, any dB level).
+      The comparator-triggered instant path only ever engages above a fixed
+      firmware floor (~88 dB) regardless of this setting — a lower threshold here
+      will still work, just only via the periodic path, not instantly.
+    </div>`;
+
+  $("setSave").onclick = async () => {
+    const btn = $("setSave"), status = $("setStatus");
+    btn.disabled = true; status.textContent = "saving…";
+    const patch = {
+      alert_enabled:     $("setEnabled").checked,
+      threshold_db:      Number($("setThreshold").value),
+      consecutive_count: Number($("setConsecutive").value),
+      cooldown_minutes:  Number($("setCooldown").value),
+    };
+    const topic = $("setTopic").value.trim();
+    if (topic) patch.ntfy_topic = topic;   // omitted key = leave unchanged, see settings fn
+    try {
+      const r = await saveSettings(forId, patch);
+      if (!r.ok) throw new Error(r.error || "save failed");
+      status.textContent = "saved " + new Date().toLocaleTimeString();
+      if (selected === forId) renderSettings();
+    } catch (e) {
+      status.textContent = "error: " + (e.message || e);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+// ============================================================================
+//  ALERTS  (fired notifications — public.alerts, separate from raw telemetry)
+// ============================================================================
+function feedbackCell(a){
+  if (a.feedback) return `<span class="muted">${a.feedback === "real" ? "✓ real" : "✗ false alarm"}</span>`;
+  return `<button data-fb="real" style="padding:3px 8px;font-size:11px">real</button>
+          <button data-fb="false_alarm" style="padding:3px 8px;font-size:11px;margin-left:4px">false alarm</button>`;
+}
+
+async function setFeedback(id, feedback){
+  try {
+    const { error } = await withTimeout(db.from("alerts")
+      .update({ feedback, feedback_at: new Date().toISOString() })
+      .eq("id", id), "alert feedback");
+    if (error) throw error;
+    renderAlerts(selected);
+  } catch (e) {
+    alert("Could not save feedback: " + (e.message || e));   // small, infrequent action — a blocking alert() is fine here
+  }
+}
+
+async function renderAlerts(deviceId){
+  const tb = $("alertsTable").querySelector("tbody");
+  if (!deviceId){ tb.innerHTML = `<tr><td colspan="6" class="empty">—</td></tr>`; return; }
+
+  const forId = deviceId;
+  let rows;
+  try {
+    const { data, error } = await withTimeout(db.from("alerts")
+      .select("id,triggered_at,rule,noise_db,threshold_db,ntfy_sent,feedback")
+      .eq("device_id", forId).order("triggered_at", { ascending: false }).limit(50), "alerts");
+    if (error) throw error;
+    rows = data || [];
+  } catch (e) {
+    if (selected !== forId) return;
+    tb.innerHTML = `<tr><td colspan="6" class="empty">could not load alerts</td></tr>`;
+    return;
+  }
+  if (selected !== forId) return;
+
+  tb.innerHTML = rows.length ? rows.map(a => `
+    <tr data-alert-id="${a.id}">
+      <td>${new Date(a.triggered_at).toLocaleString()} <span class="muted">· ${ago(a.triggered_at)}</span></td>
+      <td class="muted">${esc(a.rule)}</td>
+      <td>${a.noise_db != null ? Number(a.noise_db).toFixed(1) + " dB" : '<span class="muted">overload</span>'}</td>
+      <td class="muted">${Number(a.threshold_db).toFixed(0)} dB</td>
+      <td>${a.ntfy_sent
+            ? '<span class="tag" style="background:rgba(63,185,80,.15);color:var(--green)">sent</span>'
+            : '<span class="muted">not sent</span>'}</td>
+      <td>${feedbackCell(a)}</td>
+    </tr>`).join("")
+    : `<tr><td colspan="6" class="empty">No alerts fired yet. That is the good outcome.</td></tr>`;
+
+  tb.querySelectorAll("[data-fb]").forEach(btn =>
+    btn.onclick = () => setFeedback(Number(btn.closest("tr").dataset.alertId), btn.dataset.fb));
+}
+
+async function renderDetail(){
+  const d = devices.find(x => x.id === selected);
+  $("latestHead").textContent = d ? `Latest reading — ${d.name || d.id}` : "Latest reading";
+
+  // Independent of whether this device has any telemetry yet — a freshly
+  // registered device can still have alert settings configured and (in
+  // principle) alert history.
+  renderSettings();
+  renderAlerts(d ? d.id : null);
+
+  if(!d || !d.latest){
+    $("latest").innerHTML = `<div class="empty">No readings from this device yet.</div>`;
+    liveReset(); renderLive(null);
+    if(chart){ chart.destroy(); chart = null; }
+    $("alertTable").querySelector("tbody").innerHTML =
+      `<tr><td colspan="6" class="empty">—</td></tr>`;
+    return;
+  }
+  const L = d.latest;
+
+  // Live panel first: it is the thing being watched, and it must not wait on
+  // the 24 h history and alert queries below.
+  await liveIngest(d.id, L);
+  renderLive(L);
+
+  $("latest").innerHTML = `
+    <div><span>Battery${(L.payload&&L.payload.battery_context==="usb_present_not_soc")?" <em style='font-style:normal;color:var(--warn,#c80)'>(on USB — not a charge level)</em>":""}</span>${num(L.battery_mv!=null?L.battery_mv/1000:null,"V",2)}</div>
+    <div><span>Noise (avg)</span>${num(L.noise_db,noiseUnit(L),1,L,"noise_db")}</div>
+    <div><span>Noise (peak)</span>${num(L.payload&&L.payload.noise_peak_db,noiseUnit(L),1,L,"noise_peak_db")}</div>
+    <div><span>Noise &gt;${(L.payload&&L.payload.noise_hp_fc_hz)||200} Hz (avg)</span>${(L.payload&&L.payload.noise_hp_db!=null)?`<b>${Number(L.payload.noise_hp_db).toFixed(1)}<span class="u"> dB</span></b>`:`<b class="na">—<span class="why">build has no HP path</span></b>`}</div>
+    <div><span>Noise &gt;${(L.payload&&L.payload.noise_hp_fc_hz)||200} Hz (peak)</span>${(L.payload&&L.payload.noise_hp_peak_db!=null)?`<b>${Number(L.payload.noise_hp_peak_db).toFixed(1)}<span class="u"> dB</span></b>`:`<b class="na">—<span class="why">build has no HP path</span></b>`}</div>
+    <div><span>Temp (cavity air)</span>${num(L.board_temp_c,"°C",1,L,"board_temp_c")}</div>
+    <div><span>Humidity</span>${num(L.humidity_pct,"%",1,L,"humidity_pct")}</div>
+    <div><span>Light</span>${num(L.lux,"lx",0,L,"lux")}</div>
+    <div><span>VOC raw</span>${num(L.payload&&L.payload.sraw_voc,"ticks",0,L,"sraw_voc")}</div>
+    <div><span>NOx raw</span>${(L.payload&&L.payload.sraw_nox!=null)?`<b>${L.payload.sraw_nox}<span class="u">ticks</span></b>`:`<b class="na">—<span class="why">${(L.payload&&L.payload.sraw_nox_reason)||"no data"}</span></b>`}</div>
+    <div><span>Orientation</span>${(L.payload&&L.payload.az_g!=null)?`<b>${Number(L.payload.az_g).toFixed(2)}<span class="u">g&nbsp;Z</span></b>`:`<b class="na">—<span class="why">${(L.payload&&L.payload.sensor_errors&8)?"IMU error":"no data"}</span></b>`}</div>
+    <div><span>IMU die temp</span>${num(L.payload&&L.payload.imu_temp_c,"°C",1,L,"imu_temp_c")}</div>
+    <div><span>VOC index</span>${num(L.voc_index,"",0,L,"voc_index")}</div>
+    <div><span>NOx index</span>${num(L.nox_index,"",0,L,"nox_index")}</div>
+    <div><span>Occupancy</span>${L.occupancy==null?`<b class="na">—<span class="why">${nullReason(L,"occupancy")}</span></b>`:`<b>${["vacant","occupied","cleaning"][L.occupancy]||L.occupancy}</b>`}</div>
+    <div><span>Signal</span>${num(L.rssi,"dBm",0)}</div>
+    <div><span>Firmware</span><b style="font:13px var(--mono)">${esc(L.fw||"—")}</b></div>
+    <div><span>Received</span><b style="font-size:15px">${ago(L.ts)}</b></div>
+    <div><span>Kind</span><b style="font-size:15px">${esc(L.kind)}</b></div>`;
+
+  const since = new Date(Date.now() - 24*3600e3).toISOString();
+  const { data: hist } = await withTimeout(db.from("telemetry")
+    .select("ts,battery_mv,noise_db").eq("device_id", d.id)
+    .gte("ts", since).order("ts"), "24 h history");
+  drawChart(hist || []);
+
+  const { data: alerts } = await withTimeout(db.from("telemetry")
+    .select("ts,kind,noise_db,voc_index,battery_mv,payload")
+    .eq("device_id", d.id).neq("kind","checkin")
+    .order("ts",{ascending:false}).limit(50), "alert history");
+  const tb = $("alertTable").querySelector("tbody");
+  tb.innerHTML = (alerts && alerts.length) ? alerts.map(a => `
+    <tr>
+      <td>${new Date(a.ts).toLocaleString()} <span class="muted">· ${ago(a.ts)}</span></td>
+      <td><span class="tag ${esc(a.kind)}">${esc(a.kind)}</span></td>
+      <td>${a.noise_db!=null?Number(a.noise_db).toFixed(1)+" dB":'<span class="muted">—</span>'}</td>
+      <td>${a.voc_index ?? '<span class="muted">—</span>'}</td>
+      <td>${a.battery_mv!=null?(a.battery_mv/1000).toFixed(2)+" V":'<span class="muted">—</span>'}</td>
+      <td class="muted">${esc((a.payload && a.payload.alert_type) || "—")}</td>
+    </tr>`).join("")
+    : `<tr><td colspan="6" class="empty">No alerts. That is the good outcome.</td></tr>`;
+}
+
+// ============================================================================
+//  LIVE LEVEL  (added 2026-08-06)
+// ============================================================================
+// ⭐ WHY THIS PANEL EXISTS, AND WHAT IT IS ACTUALLY FOR.
+//    On 2026-08-06 the first live bench run produced 20 rows in 80 seconds and
+//    the level sat at 69.0-70.2 dB the whole time — a 1.2 dB span in an occupied
+//    room — then jumped to 84.6 at the end. The reading was "the app is not
+//    updating". It was: the app was faithfully rendering a number that does not
+//    move, because an unweighted level is an ENERGY TOTAL and in any real room
+//    that total is dominated by constant low-frequency content.
+//
+//    So this is not decoration on a demo. The firmware now sends a second level
+//    with everything below 200 Hz removed, and this panel puts the two side by
+//    side and measures how much each one MOVED. That comparison is the
+//    experiment that decides whether A-weighting is justified — which mic.h
+//    refuses to ship without evidence, correctly.
+//
+// ⛔ NEITHER NUMBER IS dBA. Both labels say so, permanently, not as a temporary
+//    marker. The day a validated weighting lands, these rows must still be
+//    readable as what they actually were.
+const LIVE_SPAN_MS = 60000;
+// Live mode posts every ~3.5 s (600 ms mic window + I2C sensors + the POST), so
+// anything past ~8 s is a real dropout and gets drawn as one. Used by BOTH the
+// re-seed check and the sparkline, deliberately the same number: the buffer and
+// the picture must agree about what counts as a gap.
+const LIVE_GAP_MS = 8000;
+let liveBuf = [];         // [{t, flat, hp}]  newest last
+let liveSeeded = false;
+
+// ⚠ SEED ONCE, THEN APPEND. The naive version re-queries the last 60 s on every
+//   poll, which at 1 Hz is a query per second forever for data that is almost
+//   entirely unchanged. This seeds from one query and then appends the single
+//   latest row each poll — and RE-SEEDS if a gap appears, so a dropped
+//   connection cannot leave a permanent hole in the trace that looks like
+//   silence.
+async function liveIngest(deviceId, latest){
+  const now = Date.now();
+  const cut = now - LIVE_SPAN_MS;
+
+  const newestBuffered = liveBuf.length ? liveBuf[liveBuf.length-1].t : 0;
+  const latestT = latest ? new Date(latest.ts).getTime() : 0;
+  // A gap wider than ~8 s means we missed rows; the shape of the trace would be
+  // a lie if we just appended across it.
+  const gap = latestT && newestBuffered && (latestT - newestBuffered > LIVE_GAP_MS);
+
+  if (!liveSeeded || gap){
+    const { data } = await withTimeout(db.from("telemetry")
+      .select("ts,noise_db,payload")
+      .eq("device_id", deviceId)
+      .gte("ts", new Date(cut).toISOString())
+      .order("ts"), "live level seed");
+    liveBuf = (data||[]).map(r => ({
+      t: new Date(r.ts).getTime(),
+      flat: r.noise_db != null ? Number(r.noise_db) : null,
+      hp: (r.payload && r.payload.noise_hp_db != null) ? Number(r.payload.noise_hp_db) : null
+    }));
+    liveSeeded = true;
+  } else if (latest && latestT > newestBuffered){
+    liveBuf.push({
+      t: latestT,
+      flat: latest.noise_db != null ? Number(latest.noise_db) : null,
+      hp: (latest.payload && latest.payload.noise_hp_db != null)
+            ? Number(latest.payload.noise_hp_db) : null
+    });
+  }
+  liveBuf = liveBuf.filter(p => p.t >= cut);
+}
+
+function liveReset(){ liveBuf = []; liveSeeded = false; }
+
+// Span of a series, ignoring nulls. This is the actual measurement the panel is
+// making, so it is computed once and used by both the verdict and nothing else.
+function span(vals){
+  const v = vals.filter(x => x != null);
+  if (v.length < 2) return null;
+  return Math.max(...v) - Math.min(...v);
+}
+
+// ⛔ FIXED MINIMUM Y-SPAN. THIS IS THE MOST IMPORTANT LINE IN THE FUNCTION.
+//    A sparkline that autoscales to its own data makes a 1 dB wiggle fill the
+//    full height and look like a dramatic signal. That is precisely the
+//    misreading this panel exists to correct, and it would be the chart telling
+//    the lie instead of the number. The scale is pinned to at least 25 dB so
+//    that a flat trace LOOKS flat.
+const SPARK_MIN_SPAN = 25;
+
+function drawSpark(){
+  const cv = $("spark"); if(!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  cv.width = w*dpr; cv.height = h*dpr;
+  const g = cv.getContext("2d");
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+
+  const pts = liveBuf.filter(p => p.flat != null || p.hp != null);
+  if (pts.length < 2){
+    g.fillStyle = "#4d5560"; g.font = "12px ui-monospace,monospace";
+    g.fillText("waiting for readings…", 8, h/2);
+    return;
+  }
+
+  const all = [].concat(pts.map(p=>p.flat), pts.map(p=>p.hp)).filter(v=>v!=null);
+  let lo = Math.min(...all), hi = Math.max(...all);
+  const mid = (lo+hi)/2, need = Math.max(hi-lo, SPARK_MIN_SPAN);
+  lo = mid - need/2 - 2; hi = mid + need/2 + 2;
+
+  const now = Date.now(), t0 = now - LIVE_SPAN_MS;
+  const X = t => 34 + (w-40) * Math.min(1, Math.max(0,(t-t0)/LIVE_SPAN_MS));
+  const Y = v => h-14 - (h-24) * ((v-lo)/(hi-lo));
+
+  // gridlines every 10 dB, labelled — a chart of decibels with no axis is a
+  // shape, not a measurement
+  g.strokeStyle = "#1e242d"; g.fillStyle = "#4d5560";
+  g.font = "9px ui-monospace,monospace"; g.lineWidth = 1;
+  const step = 10, first = Math.ceil(lo/step)*step;
+  for(let v=first; v<=hi; v+=step){
+    const y = Y(v); g.beginPath(); g.moveTo(34,y); g.lineTo(w-6,y); g.stroke();
+    g.fillText(String(v), 4, y+3);
+  }
+
+  const line = (key, colour) => {
+    g.strokeStyle = colour; g.lineWidth = 2; g.lineJoin = "round";
+    g.beginPath(); let open = false, prevT = 0;
+    for(const p of pts){
+      const v = p[key];
+      // ⚠ TWO different reasons to break the line, and BOTH must break it.
+      //   1. a null value  — missing data, not a value
+      //   2. a TIME GAP    — added 2026-08-06. The device was found dropping out
+      //      of live mode into a 20-minute deep sleep, and a line drawn straight
+      //      across that silence says "the level was steady for 20 minutes",
+      //      which is the opposite of the truth: we know nothing about that
+      //      interval. Bridging a gap is not a cosmetic choice, it invents data.
+      if (v == null || (open && p.t - prevT > LIVE_GAP_MS)){ open = false; }
+      if (v == null){ continue; }
+      if (!open){ g.moveTo(X(p.t), Y(v)); open = true; }
+      else g.lineTo(X(p.t), Y(v));
+      prevT = p.t;
+    }
+    g.stroke();
+    const last = [...pts].reverse().find(p => p[key] != null);
+    if (last){ g.fillStyle = colour; g.beginPath();
+      g.arc(X(last.t), Y(last[key]), 3, 0, 7); g.fill(); }
+  };
+  line("flat", "#d29922");
+  line("hp",   "#3b82f6");
+}
+
+function renderLive(latest){
+  const stale = !latest || (Date.now() - new Date(latest.ts)) > 15000;
+  const wt = latest ? noiseUnit(latest) : " dB";
+  const p  = (latest && latest.payload) || {};
+
+  const set = (id, val, unit, dp) => {
+    const el = $(id);
+    el.classList.toggle("stale", stale);
+    el.innerHTML = (val == null) ? "—"
+      : `${Number(val).toFixed(dp)}<small>${unit}</small>`;
+  };
+  set("lvFlat", latest ? latest.noise_db : null, wt, 1);
+  // ⛔ NOT wt. noiseUnit() returns "dBZ", and Z-weighting means FLAT ACROSS THE
+  //    FULL BAND — it is a specific, defined thing. A level with everything
+  //    below 200 Hz removed is not that, and calling it dBZ would be the same
+  //    class of error as calling it dBA: a real unit attached to a number that
+  //    does not satisfy it. A bare "dB" plus the cutoff in the header is the
+  //    honest label, and the cutoff comes from the row, never assumed.
+  set("lvHp",   p.noise_hp_db != null ? p.noise_hp_db : null, " dB", 1);
+
+  if (p.noise_hp_fc_hz) $("lvHpLabel").textContent =
+    `Above ${p.noise_hp_fc_hz} Hz · diagnostic`;
+
+  const pk = (v) => v == null ? "peak —" : `peak ${Number(v).toFixed(1)}`;
+  $("lvFlatSub").textContent = pk(p.noise_peak_db) +
+    (latest && latest.noise_db != null ? ` · window ${p.noise_window_ms||"?"} ms` : "");
+  $("lvHpSub").textContent = pk(p.noise_hp_peak_db);
+
+  $("liveHead").textContent = stale
+    ? `Live level — ${latest ? "stale, last heard " + ago(latest.ts) : "no data"}`
+    : "Live level";
+
+  // ---- the verdict --------------------------------------------------------
+  const sFlat = span(liveBuf.map(p=>p.flat));
+  const sHp   = span(liveBuf.map(p=>p.hp));
+  const n     = liveBuf.length;
+  const v = $("verdict");
+  const q = `<span class="q">Is the flat level pinned by low-frequency energy?</span>`;
+
+  if (n < 5){
+    v.innerHTML = q + `Collecting — ${n} reading${n===1?"":"s"} in the last 60 s. ` +
+      `Needs about 5 before a span means anything.`;
+  } else if (sHp == null){
+    v.innerHTML = q +
+      `<b>Cannot tell yet.</b> This device is not sending <code>noise_hp_db</code>, ` +
+      `so there is nothing to compare against. That is a firmware build without ` +
+      `<code>MIC_HP_ENABLED</code>, not a sensor fault. ` +
+      `Full band moved <b>${sFlat.toFixed(1)} dB</b> over ${n} readings.`;
+  } else {
+    // ⚠ The threshold is deliberately generous. This is a first look at a
+    //   hypothesis, not a hypothesis test, and claiming significance from 60
+    //   seconds of one board would be exactly the overreach this project keeps
+    //   catching itself in.
+    const ratio = sFlat > 0.05 ? (sHp/sFlat) : null;
+    let call;
+    if (ratio == null)            call = `Neither number moved. Nothing to conclude — make some noise.`;
+    else if (ratio >= 2.5)        call = `<b>Consistent with yes.</b> The high-passed level is <b>${ratio.toFixed(1)}x</b> more responsive over the same 60 s. If that holds across a few runs, it is the evidence A-weighting has been waiting for.`;
+    else if (ratio >= 1.3)        call = `<b>Leaning yes, weakly.</b> ${ratio.toFixed(1)}x more responsive — a real difference, but not yet the large one the hypothesis predicts. Try a longer run and a noisier room.`;
+    else                          call = `<b>Not supported.</b> Removing everything below ${p.noise_hp_fc_hz||200} Hz barely changed the responsiveness (${ratio.toFixed(1)}x). The flat level is flat for some other reason, and that is worth chasing.`;
+    v.innerHTML = q +
+      `Over the last 60 s (${n} readings): full band moved <b>${sFlat.toFixed(1)} dB</b>, ` +
+      `high-passed moved <b>${sHp.toFixed(1)} dB</b>. ${call}`;
+  }
+  drawSpark();
+}
+
+function drawChart(rows){
+  if(chart) chart.destroy();
+  if(!rows.length){ return; }
+  const grid = "#262d38", tick = "#8b949e";
+  chart = new Chart($("chart"), {
+    type:"line",
+    data:{
+      labels: rows.map(r => new Date(r.ts).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})),
+      datasets:[
+        { label:"Battery (V)", yAxisID:"y",
+          data: rows.map(r => r.battery_mv!=null ? r.battery_mv/1000 : null),
+          borderColor:"#3b82f6", backgroundColor:"rgba(59,130,246,.10)",
+          // ⛔ spanGaps WAS true. It bridged every null with a straight line, so
+          //    a device that reported nothing for twenty minutes drew as a
+          //    steady reading across the whole silence. Changed 2026-08-06 after
+          //    the live-mode dropout was found: a break is the honest rendering
+          //    of "we do not know", and it is also the only way the dropouts are
+          //    visible at all on this chart.
+          borderWidth:2, tension:.3, pointRadius:0, fill:true, spanGaps:false },
+        { label:"Noise (dB)", yAxisID:"y1",
+          data: rows.map(r => r.noise_db),
+          borderColor:"#d29922", borderWidth:2, tension:.3, pointRadius:0, spanGaps:false }
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{ mode:"index", intersect:false },
+      plugins:{ legend:{ labels:{ color:tick, boxWidth:12, font:{size:11} } } },
+      scales:{
+        x:{ grid:{color:grid}, ticks:{color:tick, maxTicksLimit:8, font:{size:10}} },
+        y:{ position:"left",  grid:{color:grid}, ticks:{color:"#3b82f6", font:{size:10}},
+            title:{display:true, text:"Battery V", color:"#3b82f6", font:{size:10}} },
+        y1:{ position:"right", grid:{drawOnChartArea:false}, ticks:{color:"#d29922", font:{size:10}},
+            title:{display:true, text:"Noise dB", color:"#d29922", font:{size:10}} }
+      }
+    }
+  });
+}
+
+$("refresh").onclick = load;
+
+// ============================================================================
+//  LIVE AUTO-REFRESH  (added 2026-08-06)
+// ============================================================================
+// The device in BENCH_LIVE_MODE posts roughly every 1.5 s. Clicking Refresh by
+// hand to see that is not a demonstration, it is a chore.
+//
+// ⚠ NOT setInterval(load, 1000). load() is async and makes several round trips;
+//   a fixed interval would stack overlapping requests the moment the network is
+//   slower than the timer, and they would land out of order — so the panel could
+//   show an OLDER reading after a newer one. A self-rescheduling timer that only
+//   starts counting once the previous load has FINISHED cannot overlap and
+//   cannot go backwards.
+// ⚠ Also paused while the tab is hidden. A backgrounded tab polling a database
+//   forever is how a demo aid turns into a bill.
+const AUTO_MS = 1000;
+let autoTimer = null, autoBusy = false;
+
+async function autoTick(){
+  if (document.hidden || !$("autorefresh").checked || autoBusy) return schedule();
+  autoBusy = true;
+  try { await load(); $("autotick").textContent = "· " + new Date().toLocaleTimeString(); }
+  catch(e){ /* load() already surfaces its own errors */ }
+  finally { autoBusy = false; schedule(); }
+}
+function schedule(){
+  clearTimeout(autoTimer);
+  if ($("autorefresh").checked) autoTimer = setTimeout(autoTick, AUTO_MS);
+}
+$("autorefresh").onchange = () => {
+  $("autotick").textContent = "";
+  if ($("autorefresh").checked) autoTick(); else clearTimeout(autoTimer);
+};
+document.addEventListener("visibilitychange", () => { if(!document.hidden) schedule(); });
+// The sparkline sizes itself from the canvas' CSS box, so it has to be redrawn
+// when that box changes. Cheap: it draws from the buffer, it does not refetch.
+addEventListener("resize", drawSpark);
+
+// ?device=desibel-002 deep-links straight to that device — lets an ntfy
+// notification link land on the right panel instead of just the fleet view.
+// Must run before the first load(): it only pre-seeds `selected`, and load()
+// itself is what validates it against the real device list.
+const urlDevice = new URLSearchParams(location.search).get("device");
+if (urlDevice) selected = urlDevice;
+
+load().then(schedule);
+setInterval(load, 60000);
+</script>
+</body>
+</html>
