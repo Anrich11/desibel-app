@@ -229,6 +229,9 @@
   <h2>Alert settings</h2>
   <div class="panel" id="settingsPanel"><div class="empty">—</div></div>
 
+  <h2>Baseline</h2>
+  <div class="panel" id="baselinePanel"><div class="empty">—</div></div>
+
   <h2>Last 24 hours</h2>
   <div class="panel chartwrap"><canvas id="chart"></canvas></div>
 
@@ -724,6 +727,81 @@ async function renderAlerts(deviceId){
     btn.onclick = () => setFeedback(Number(btn.closest("tr").dataset.alertId), btn.dataset.fb));
 }
 
+// ============================================================================
+//  BASELINE  (added 2026-08-15 — "a baseline building phase... like a
+//  smartwatch does with your body". Informational only: never modifies
+//  settings.threshold_db, never fires a notification by itself. Backed by
+//  telemetry_baseline_status(), a per-device time-aware EWMA mean/variance —
+//  see that function's SQL comments for the full design. Read-only, so
+//  (unlike renderSettings()) this can safely re-fetch on every auto-refresh
+//  tick without wiping anything a user is mid-edit on — no dirty-state guard
+//  needed here.
+// ============================================================================
+// ⛔ NOT the Sensirion Gas Index Algorithm for VOC/NOx — a much simpler custom
+//   deviation signal. Never call it an "index" in this UI; see the backend
+//   function's own comment for why that distinction matters here.
+const METRIC_LABEL = { noise_db: "Noise", sraw_voc: "VOC (raw ticks)", sraw_nox: "NOx (raw ticks)" };
+
+function baselineRowHtml(row){
+  const label = METRIC_LABEL[row.metric] || row.metric;
+  const cur = row.current_value != null ? Number(row.current_value).toFixed(1) : "—";
+  if (!row.is_significant){
+    return `<div style="margin-bottom:10px">
+      <b>${esc(label)}</b> <span class="muted">— current ${cur} · not enough history yet
+      (${row.n_updates} reading${row.n_updates===1?"":"s"} over ${row.hours_tracked}h,
+      needs ~${(row.tau_hours*0.3).toFixed(0)}h at the current ${row.tau_hours}h baseline window)</span>
+    </div>`;
+  }
+  const z = Number(row.z);
+  const az = Math.abs(z);
+  const verdict = az < 1 ? "typical for this device"
+    : `${az.toFixed(1)}σ ${z > 0 ? "above" : "below"} usual`;
+  const colour = az >= 3 ? "var(--red)" : az >= 2 ? "var(--amber)" : "var(--dim)";
+  return `<div style="margin-bottom:10px">
+    <b>${esc(label)}</b> current ${cur}, baseline ${Number(row.mean).toFixed(1)}
+    (±${Number(row.stddev).toFixed(2)}) — <span style="color:${colour}">${verdict}</span>
+    <span class="muted"> · ${row.n_updates} readings over ${row.hours_tracked}h</span>
+  </div>`;
+}
+
+async function renderBaseline(deviceId){
+  const box = $("baselinePanel");
+  if (!deviceId){ box.innerHTML = `<div class="empty">—</div>`; return; }
+
+  const forId = deviceId;   // same staleness guard as renderAlerts/renderSettings
+  let rows, tau;
+  try {
+    const { data, error } = await withTimeout(
+      db.rpc("telemetry_baseline_status", { p_device_id: forId }), "baseline status");
+    if (error) throw error;
+    rows = data || [];
+    const s = await loadSettings(forId);   // for the tau_hours readout + bench/field note
+    tau = s.ok ? s.baseline_tau_hours : null;
+  } catch (e) {
+    if (selected !== forId) return;
+    box.innerHTML = `<div class="err"><b>Could not load baseline.</b><code>${esc(e.message || e)}</code></div>`;
+    return;
+  }
+  if (selected !== forId) return;
+
+  if (!rows.length){
+    box.innerHTML = `<div class="empty">No baseline data yet — accumulates automatically from check-ins, nothing to configure.</div>`;
+    return;
+  }
+
+  const order = ["noise_db", "sraw_voc", "sraw_nox"];
+  const sorted = [...rows].sort((a, b) => order.indexOf(a.metric) - order.indexOf(b.metric));
+
+  box.innerHTML = sorted.map(baselineRowHtml).join("") + `
+    <div style="margin-top:8px;font-size:11.5px;color:var(--dimmer);line-height:1.5">
+      ⚠ Adaptive baseline, informational only — never changes the alert threshold above.
+      Window: ${tau != null ? tau + "h" : "?"} (~${tau != null ? (tau/24).toFixed(1) : "?"} days).
+      A short window (hours) is for active bench tuning, so you can actually see this
+      converge within a session; set it back to something like 720h (30 days, "monthly")
+      for real field use, in the Alert settings panel above.
+    </div>`;
+}
+
 async function renderDetail(){
   const d = devices.find(x => x.id === selected);
   $("latestHead").textContent = d ? `Latest reading — ${d.name || d.id}` : "Latest reading";
@@ -733,6 +811,7 @@ async function renderDetail(){
   // principle) alert history.
   renderSettings();
   renderAlerts(d ? d.id : null);
+  renderBaseline(d ? d.id : null);
 
   if(!d || !d.latest){
     $("latest").innerHTML = `<div class="empty">No readings from this device yet.</div>`;
