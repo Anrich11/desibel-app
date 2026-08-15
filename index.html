@@ -348,6 +348,18 @@ const noiseUnit = row => {
   const w = row && row.payload && row.payload.noise_weighting;
   return w ? " dB" + w : " dB";
 };
+// ⭐ ADDED 2026-08-15 — battery_pct is a GENERIC 1S LiPo resting-voltage
+//   curve (see the battery_percent_1s_lipo() function comment, Supabase
+//   migration), not characterized against this product's cell, and reads
+//   LOW under continuous draw (e.g. bench testing) vs true resting charge —
+//   hence "~" and the title tooltip on every use, same discipline as the
+//   mic's Z-vs-dBA labelling elsewhere in this file. NULL (row.battery_pct
+//   == null) already covers both "no reading" and "on USB, not a SOC" —
+//   nothing extra to check here.
+const battPctSuffix = row =>
+  (row && row.battery_pct != null)
+    ? ` <span class="muted" title="Estimated from a generic 1S LiPo resting curve — reads low under continuous load, see backend notes">(~${Number(row.battery_pct).toFixed(0)}%)</span>`
+    : "";
 const num = (v, unit, dp=0, row=null, field=null) =>
   (v === null || v === undefined)
     ? `<b class="na">—<span class="why">${row?nullReason(row,field):""}</span></b>`
@@ -422,7 +434,7 @@ function renderDevices(){
       </div>
       <div class="id">${esc(d.id)} · ${h.t} · ${L ? ago(L.ts) : "no readings"}</div>
       <div class="kv">
-        <div><span>Battery</span>${num(L && L.battery_mv != null ? L.battery_mv/1000 : null,"V",2)}</div>
+        <div><span>Battery</span>${num(L && L.battery_mv != null ? L.battery_mv/1000 : null,"V",2)}${battPctSuffix(L)}</div>
         <div><span>Noise</span>${num(L && L.noise_db,"dB",0,L,"noise_db")}</div>
         <div><span>Temp</span>${num(L && L.board_temp_c,"°C",1,L,"board_temp_c")}</div>
       </div>
@@ -501,7 +513,7 @@ function renderKpis(){
     tile("Fleet online", `<b>${k.online}<span class="u"> / ${k.total}</span></b>`, null),
     tile("Lowest battery",
       k.lowestBattery != null
-        ? `<b>${k.lowestBattery.toFixed(2)}<span class="u"> V</span></b> <span class="muted">${esc(k.lowestBatteryDev.name || k.lowestBatteryDev.id)}</span>`
+        ? `<b>${k.lowestBattery.toFixed(2)}<span class="u"> V</span></b>${battPctSuffix(k.lowestBatteryDev.latest)} <span class="muted">${esc(k.lowestBatteryDev.name || k.lowestBatteryDev.id)}</span>`
         : `<b class="na">—</b>`,
       k.lowestBatteryDev),
     tile("Loudest now",
@@ -738,7 +750,7 @@ async function renderDetail(){
   renderLive(L);
 
   $("latest").innerHTML = `
-    <div><span>Battery${(L.payload&&L.payload.battery_context==="usb_present_not_soc")?" <em style='font-style:normal;color:var(--warn,#c80)'>(on USB — not a charge level)</em>":""}</span>${num(L.battery_mv!=null?L.battery_mv/1000:null,"V",2)}</div>
+    <div><span>Battery${(L.payload&&L.payload.battery_context==="usb_present_not_soc")?" <em style='font-style:normal;color:var(--warn,#c80)'>(on USB — not a charge level)</em>":""}</span>${num(L.battery_mv!=null?L.battery_mv/1000:null,"V",2)}${battPctSuffix(L)}</div>
     <div><span>Noise (avg)</span>${num(L.noise_db,noiseUnit(L),1,L,"noise_db")}</div>
     <div><span>Noise (peak)</span>${num(L.payload&&L.payload.noise_peak_db,noiseUnit(L),1,L,"noise_peak_db")}</div>
     <div><span>Noise &gt;${(L.payload&&L.payload.noise_hp_fc_hz)||200} Hz (avg)</span>${(L.payload&&L.payload.noise_hp_db!=null)?`<b>${Number(L.payload.noise_hp_db).toFixed(1)}<span class="u"> dB</span></b>`:`<b class="na">—<span class="why">build has no HP path</span></b>`}</div>
